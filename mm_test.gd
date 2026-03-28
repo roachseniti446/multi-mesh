@@ -2,7 +2,9 @@ extends Node3D
 
 @export var swarm_count: int = 100000
 @export var spawn_radius: float = 50.0
-@export var enable_colors: bool = false
+# The shader is now setup to expect colors. If we don't pass it the stride will be off.
+var enable_colors: bool = true
+# @export var enable_colors: bool = false
 @export var enable_compute: bool = true # Turned on by default now!
 
 var mmi: MultiMeshInstance3D

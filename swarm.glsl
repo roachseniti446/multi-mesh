@@ -10,10 +10,12 @@ struct Entity {
 };
 
 // The Godot MultiMesh 3D Transform format (12 floats, strict row-major)
+// UPDATED: Now 64 bytes to match use_colors = true
 struct MultiMeshTransform {
     vec4 row0; // basis.x.x, basis.y.x, basis.z.x, origin.x
     vec4 row1; // basis.x.y, basis.y.y, basis.z.y, origin.y
     vec4 row2; // basis.x.z, basis.y.z, basis.z.z, origin.z
+    vec4 color;
 };
 
 // -----------------------------------------------------------------------------
@@ -65,10 +67,20 @@ void main() {
     // Write state back to our physics buffer
     entities[idx] = e;
 
+    // --- DYNAMIC COLOR MATH ---
+    // Map the Y position (-100 to 100) to a 0.0 to 1.0 range
+    float normalized_height = (e.position.y + 100.0) / 200.0;
+    
+    // Mix between a deep blue at the bottom and a hot pink/red at the top
+    vec3 color_bottom = vec3(0.0, 0.2, 0.8);
+    vec3 color_top = vec3(1.0, 0.1, 0.4);
+    vec3 final_color = mix(color_bottom, color_top, normalized_height);
+
     // --- WRITE TO MULTIMESH ---
-    // Notice we keep the basis as an identity matrix (1s on the diagonal) 
-    // and just update the origin (w component).
     final_transforms[idx].row0 = vec4(1.0, 0.0, 0.0, e.position.x);
     final_transforms[idx].row1 = vec4(0.0, 1.0, 0.0, e.position.y);
     final_transforms[idx].row2 = vec4(0.0, 0.0, 1.0, e.position.z);
+    
+    // Write the calculated color
+    final_transforms[idx].color = vec4(final_color, 1.0);
 }
