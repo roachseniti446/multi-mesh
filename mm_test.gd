@@ -1,24 +1,31 @@
 extends Node3D
 
-@export var swarm_count: int = 10000
+@export var swarm_count: int = 100000
 @export var spawn_radius: float = 50.0
 
-# Hardcoded now because we will always use compute and the shader expects color otherwise the stride will be off
 var enable_colors: bool = true
 var enable_compute: bool = true
 
 var cam: Camera3D
 
 # --- Low-Level Rendering Variables ---
-var swarm_multimesh: MultiMesh # Keep a reference so it isn't garbage collected
+var base_mesh: BoxMesh         # MUST keep a reference so it isn't garbage collected.
+var mm_rid: RID                # The raw MultiMesh RID
 var rs_instance: RID           # The raw RenderingServer instance RID
 
 # --- Compute Variables ---
 var rd: RenderingDevice
-var shader: RID
-var shader_pipeline: RID
-var uniform_set: RID
+
+var cull_shader: RID
+var cull_pipeline: RID
+var cull_uniform_set: RID
+
+var cmd_shader: RID
+var cmd_pipeline: RID
+var cmd_uniform_set: RID
+
 var entity_buffer: RID
+var counter_buffer: RID # BUFFER B: Atomic Counter
 var push_constant_bytes := PackedByteArray()
 var time_elapsed: float = 0.0
 var compute_initialized: bool = false
@@ -31,6 +38,9 @@ func _ready() -> void:
 	_setup_server_swarm()
 	
 	if enable_compute:
+		# Wait until the Render Thread has fully processed and drawn a frame.
+		# This guarantees the hardware RenderingDevice buffers now exist in VRAM.
+		await RenderingServer.frame_post_draw
 		call_deferred("_init_compute")
 
 func _setup_camera() -> void:
@@ -44,45 +54,41 @@ func _setup_camera() -> void:
 	cam.make_current()
 
 func _setup_server_swarm() -> void:
-	# ==========================================
-	# 1. BUFFER FORMAT SETUP
-	# ==========================================
-	swarm_multimesh = MultiMesh.new()
-	swarm_multimesh.transform_format = MultiMesh.TRANSFORM_3D
-	swarm_multimesh.use_colors = enable_colors       
-	swarm_multimesh.use_custom_data = false 
-	
-	var box_mesh = BoxMesh.new()
-	box_mesh.size = Vector3(1, 1, 1)
+	# 1. Create and hold onto the base mesh
+	base_mesh = BoxMesh.new()
+	base_mesh.size = Vector3(1, 1, 1)
 	
 	if enable_colors:
 		var mat = StandardMaterial3D.new()
 		mat.vertex_color_use_as_albedo = true
-		box_mesh.material = mat
+		base_mesh.material = mat
 	
-	swarm_multimesh.mesh = box_mesh
+	# 2. Create the MultiMesh completely on the RenderingServer
+	mm_rid = RenderingServer.multimesh_create()
 	
-	# ==========================================
-	# 3. ALLOCATE AND POPULATE
-	# ==========================================
-	swarm_multimesh.instance_count = swarm_count
+	# 3. Allocate the memory WITH the indirect flag (the 'true' at the end)
+	RenderingServer.multimesh_allocate_data(
+		mm_rid, 
+		swarm_count, 
+		RenderingServer.MULTIMESH_TRANSFORM_3D, 
+		enable_colors, 
+		false,         
+		true           # use_indirect = true!
+	)
 	
-	# Populate the initial positions (will be overwritten by compute, but good for setup)
+	# 4. Assign the mesh
+	RenderingServer.multimesh_set_mesh(mm_rid, base_mesh.get_rid())
+	
+	# 5. Populate initial zero-state data
 	for i in swarm_count:
 		var t = Transform3D(Basis(), Vector3.ZERO)
-		swarm_multimesh.set_instance_transform(i, t)
+		RenderingServer.multimesh_instance_set_transform(mm_rid, i, t)
 		if enable_colors:
-			swarm_multimesh.set_instance_color(i, Color(1, 1, 1, 1))
+			RenderingServer.multimesh_instance_set_color(mm_rid, i, Color(1, 1, 1, 1))
 
-	# ==========================================
-	# 4. CREATE THE SERVER INSTANCE
-	# ==========================================
+	# 6. Create the instance and attach to world
 	rs_instance = RenderingServer.instance_create()
-	
-	# Attach the MultiMesh to the instance
-	RenderingServer.instance_set_base(rs_instance, swarm_multimesh.get_rid())
-	
-	# Attach the instance to the current 3D world's scenario so it becomes visible
+	RenderingServer.instance_set_base(rs_instance, mm_rid)
 	var scenario = get_world_3d().scenario
 	RenderingServer.instance_set_scenario(rs_instance, scenario)
 	
@@ -96,13 +102,16 @@ func _init_compute() -> void:
 		push_error("Compute unavailable.")
 		return
 
-	# 1. Compile Shader
-	var shader_file = load("res://swarm.glsl")
-	var shader_spirv: RDShaderSPIRV = shader_file.get_spirv()
-	shader = rd.shader_create_from_spirv(shader_spirv)
-	shader_pipeline = rd.compute_pipeline_create(shader)
+	# 1. Compile BOTH Shaders
+	var cull_file = load("res://swarm.glsl")
+	cull_shader = rd.shader_create_from_spirv(cull_file.get_spirv())
+	cull_pipeline = rd.compute_pipeline_create(cull_shader)
+	
+	var cmd_file = load("res://command_writer.glsl")
+	cmd_shader = rd.shader_create_from_spirv(cmd_file.get_spirv())
+	cmd_pipeline = rd.compute_pipeline_create(cmd_shader)
 
-	# 2. Setup our custom Entity Physics Buffer
+	# 2. Setup Entity Buffer (Buffer A)
 	var entity_bytes := PackedByteArray()
 	entity_bytes.resize(swarm_count * 32) # 32 bytes per struct (vec4 pos, vec4 vel)
 	
@@ -124,24 +133,47 @@ func _init_compute() -> void:
 
 	entity_buffer = rd.storage_buffer_create(entity_bytes.size(), entity_bytes)
 
-	# 3. Hijack Godot's MultiMesh Buffer
-	var target_multimesh = swarm_multimesh.get_rid()
-	var output_buffer = RenderingServer.multimesh_get_buffer_rd_rid(target_multimesh)
+	# 3. Setup Atomic Counter Buffer (Buffer B)
+	var counter_bytes := PackedByteArray()
+	counter_bytes.resize(4) # 1 uint initialized to 0
+	counter_buffer = rd.storage_buffer_create(counter_bytes.size(), counter_bytes)
 
-	# 4. Create Uniform Set
-	var entity_uniform := RDUniform.new()
-	entity_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
-	entity_uniform.binding = 0
-	entity_uniform.add_id(entity_buffer)
+	# 4. Grab MultiMesh Buffers (Buffers C & D)
+	# Using the raw mm_rid from our pure server setup!
+	var mm_output_buffer = RenderingServer.multimesh_get_buffer_rd_rid(mm_rid)
+	var mm_cmd_buffer = RenderingServer.multimesh_get_command_buffer_rd_rid(mm_rid)
 
-	var output_uniform := RDUniform.new()
-	output_uniform.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
-	output_uniform.binding = 1
-	output_uniform.add_id(output_buffer)
+	# 5. Create Uniforms - CULLING PASS
+	var u_entities = RDUniform.new()
+	u_entities.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
+	u_entities.binding = 0
+	u_entities.add_id(entity_buffer)
 
-	uniform_set = rd.uniform_set_create([entity_uniform, output_uniform], shader, 0)
+	var u_output = RDUniform.new()
+	u_output.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
+	u_output.binding = 1
+	u_output.add_id(mm_output_buffer)
 	
-	# 16 bytes for time/delta/count + 96 bytes for the 6 frustum planes
+	var u_counter_cull = RDUniform.new()
+	u_counter_cull.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
+	u_counter_cull.binding = 2
+	u_counter_cull.add_id(counter_buffer)
+
+	cull_uniform_set = rd.uniform_set_create([u_entities, u_output, u_counter_cull], cull_shader, 0)
+	
+	# 6. Create Uniforms - COMMAND WRITER PASS
+	var u_counter_cmd = RDUniform.new()
+	u_counter_cmd.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
+	u_counter_cmd.binding = 0
+	u_counter_cmd.add_id(counter_buffer)
+	
+	var u_cmd_output = RDUniform.new()
+	u_cmd_output.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
+	u_cmd_output.binding = 1
+	u_cmd_output.add_id(mm_cmd_buffer)
+	
+	cmd_uniform_set = rd.uniform_set_create([u_counter_cmd, u_cmd_output], cmd_shader, 0)
+	
 	push_constant_bytes.resize(112)
 	compute_initialized = true
 
@@ -169,16 +201,29 @@ func _process(delta: float) -> void:
 		push_constant_bytes.encode_float(offset + 8, p.normal.z)
 		push_constant_bytes.encode_float(offset + 12, p.d)
 		offset += 16
+		
+	# 2. Reset the atomic counter BEFORE starting the compute list
+	rd.buffer_clear(counter_buffer, 0, 4)
 	
-	# Dispatch
-	var compute_list = rd.compute_list_begin()
-	rd.compute_list_bind_compute_pipeline(compute_list, shader_pipeline)
-	rd.compute_list_bind_uniform_set(compute_list, uniform_set, 0)
-	rd.compute_list_set_push_constant(compute_list, push_constant_bytes, push_constant_bytes.size())
+	#var _compute_list = rd.compute_list_begin()
 	
+	# --- PASS 1: Physics & Culling ---
+	var cull_list = rd.compute_list_begin()
+	rd.compute_list_bind_compute_pipeline(cull_list, cull_pipeline)
+	rd.compute_list_bind_uniform_set(cull_list, cull_uniform_set, 0)
+	rd.compute_list_set_push_constant(cull_list, push_constant_bytes, push_constant_bytes.size())
 	var workgroups_x = ceil(swarm_count / 64.0)
-	rd.compute_list_dispatch(compute_list, workgroups_x, 1, 1)
+	rd.compute_list_dispatch(cull_list, workgroups_x, 1, 1)
+	rd.compute_list_add_barrier(cull_list) # Wait for buffer B and C
+	rd.compute_list_end()
 	
+	# --- PASS 2: Write Command Buffer ---
+	# A brand new list. No push constant state carried over.
+	var cmd_list = rd.compute_list_begin()
+	rd.compute_list_bind_compute_pipeline(cmd_list, cmd_pipeline)
+	rd.compute_list_bind_uniform_set(cmd_list, cmd_uniform_set, 0)
+	rd.compute_list_dispatch(cmd_list, 1, 1, 1)
+	rd.compute_list_add_barrier(cmd_list) # Wait for buffer D
 	rd.compute_list_end()
 
 # --- CRITICAL: MANUAL MEMORY MANAGEMENT ---
@@ -186,3 +231,5 @@ func _exit_tree() -> void:
 	# When bypassing the scene tree, we are responsible for cleaning up the RIDs
 	if rs_instance.is_valid():
 		RenderingServer.free_rid(rs_instance)
+	if mm_rid.is_valid():
+		RenderingServer.free_rid(mm_rid)

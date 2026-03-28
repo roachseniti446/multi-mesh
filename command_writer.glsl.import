@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://dm2kmuyblyvf"
+path="res://.godot/imported/command_writer.glsl-0857689c3ba11c2ee0f930e03b7e7625.res"
+
+[deps]
+
+source_file="res://command_writer.glsl"
+dest_files=["res://.godot/imported/command_writer.glsl-0857689c3ba11c2ee0f930e03b7e7625.res"]
+
+[params]
+
