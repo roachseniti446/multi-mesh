@@ -1,14 +1,17 @@
 extends Node3D
 
-@export var swarm_count: int = 100000
+@export var swarm_count: int = 10000
 @export var spawn_radius: float = 50.0
-# The shader is now setup to expect colors. If we don't pass it the stride will be off.
-var enable_colors: bool = true
-# @export var enable_colors: bool = false
-@export var enable_compute: bool = true # Turned on by default now!
 
-var mmi: MultiMeshInstance3D
+# Hardcoded now because we will always use compute and the shader expects color otherwise the stride will be off
+var enable_colors: bool = true
+var enable_compute: bool = true
+
 var cam: Camera3D
+
+# --- Low-Level Rendering Variables ---
+var swarm_multimesh: MultiMesh # Keep a reference so it isn't garbage collected
+var rs_instance: RID           # The raw RenderingServer instance RID
 
 # --- Compute Variables ---
 var rd: RenderingDevice
@@ -21,9 +24,11 @@ var time_elapsed: float = 0.0
 var compute_initialized: bool = false
 
 func _ready() -> void:
-	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
+	# uncomment this line to check for bottlenecks. it will attempt to run its fps as high as it can.
+	# DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
+	
 	_setup_camera()
-	_setup_static_swarm()
+	_setup_server_swarm()
 	
 	if enable_compute:
 		call_deferred("_init_compute")
@@ -38,23 +43,15 @@ func _setup_camera() -> void:
 	cam.look_at(Vector3.ZERO)
 	cam.make_current()
 
-func _setup_static_swarm() -> void:
-	mmi = MultiMeshInstance3D.new()
-	
-	mmi.name = "SwarmMultiMesh"
-	
-	var swarm_multimesh = MultiMesh.new()
-	
+func _setup_server_swarm() -> void:
 	# ==========================================
 	# 1. BUFFER FORMAT SETUP
 	# ==========================================
+	swarm_multimesh = MultiMesh.new()
 	swarm_multimesh.transform_format = MultiMesh.TRANSFORM_3D
 	swarm_multimesh.use_colors = enable_colors       
 	swarm_multimesh.use_custom_data = false 
 	
-	# ==========================================
-	# 2. MESH AND MATERIAL SETUP
-	# ==========================================
 	var box_mesh = BoxMesh.new()
 	box_mesh.size = Vector3(1, 1, 1)
 	
@@ -69,27 +66,29 @@ func _setup_static_swarm() -> void:
 	# 3. ALLOCATE AND POPULATE
 	# ==========================================
 	swarm_multimesh.instance_count = swarm_count
-	mmi.multimesh = swarm_multimesh
 	
+	# Populate the initial positions (will be overwritten by compute, but good for setup)
 	for i in swarm_count:
-		var random_pos = Vector3(
-			randf_range(-spawn_radius, spawn_radius),
-			randf_range(-spawn_radius, spawn_radius),
-			randf_range(-spawn_radius, spawn_radius)
-		)
-		
-		var t = Transform3D(Basis(), random_pos)
+		var t = Transform3D(Basis(), Vector3.ZERO)
 		swarm_multimesh.set_instance_transform(i, t)
-		
 		if enable_colors:
-			var random_color = Color(randf(), randf(), randf(), 1.0)
-			swarm_multimesh.set_instance_color(i, random_color)
+			swarm_multimesh.set_instance_color(i, Color(1, 1, 1, 1))
+
+	# ==========================================
+	# 4. CREATE THE SERVER INSTANCE
+	# ==========================================
+	rs_instance = RenderingServer.instance_create()
 	
-	# ==========================================
-	# 4. SCENE INTEGRATION
-	# ==========================================
-	mmi.custom_aabb = AABB(Vector3(-10000, -10000, -10000), Vector3(20000, 20000, 20000))
-	add_child(mmi)
+	# Attach the MultiMesh to the instance
+	RenderingServer.instance_set_base(rs_instance, swarm_multimesh.get_rid())
+	
+	# Attach the instance to the current 3D world's scenario so it becomes visible
+	var scenario = get_world_3d().scenario
+	RenderingServer.instance_set_scenario(rs_instance, scenario)
+	
+	# Prevent Frustum Culling
+	var massive_aabb = AABB(Vector3(-10000, -10000, -10000), Vector3(20000, 20000, 20000))
+	RenderingServer.instance_set_custom_aabb(rs_instance, massive_aabb)
 
 func _init_compute() -> void:
 	rd = RenderingServer.get_rendering_device()
@@ -126,7 +125,7 @@ func _init_compute() -> void:
 	entity_buffer = rd.storage_buffer_create(entity_bytes.size(), entity_bytes)
 
 	# 3. Hijack Godot's MultiMesh Buffer
-	var target_multimesh = mmi.multimesh.get_rid()
+	var target_multimesh = swarm_multimesh.get_rid()
 	var output_buffer = RenderingServer.multimesh_get_buffer_rd_rid(target_multimesh)
 
 	# 4. Create Uniform Set
@@ -165,3 +164,9 @@ func _process(delta: float) -> void:
 	rd.compute_list_dispatch(compute_list, workgroups_x, 1, 1)
 	
 	rd.compute_list_end()
+
+# --- CRITICAL: MANUAL MEMORY MANAGEMENT ---
+func _exit_tree() -> void:
+	# When bypassing the scene tree, we are responsible for cleaning up the RIDs
+	if rs_instance.is_valid():
+		RenderingServer.free_rid(rs_instance)
