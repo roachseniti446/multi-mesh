@@ -141,7 +141,8 @@ func _init_compute() -> void:
 
 	uniform_set = rd.uniform_set_create([entity_uniform, output_uniform], shader, 0)
 	
-	push_constant_bytes.resize(16) # float time, float delta, uint total_instances, padding
+	# 16 bytes for time/delta/count + 96 bytes for the 6 frustum planes
+	push_constant_bytes.resize(112)
 	compute_initialized = true
 
 func _process(delta: float) -> void:
@@ -153,6 +154,21 @@ func _process(delta: float) -> void:
 	push_constant_bytes.encode_float(0, time_elapsed)
 	push_constant_bytes.encode_float(4, delta)
 	push_constant_bytes.encode_u32(8, swarm_count)
+	# bytes 12-15 are the padding
+	
+	# 2. Extract and Pack Camera Frustum Planes
+	# get_frustum() returns an Array[Plane] of size 6
+	var planes = cam.get_frustum()
+	var offset = 16 
+	
+	for i in 6:
+		var p: Plane = planes[i]
+		# Plane normal (xyz) and distance (w)
+		push_constant_bytes.encode_float(offset + 0, p.normal.x)
+		push_constant_bytes.encode_float(offset + 4, p.normal.y)
+		push_constant_bytes.encode_float(offset + 8, p.normal.z)
+		push_constant_bytes.encode_float(offset + 12, p.d)
+		offset += 16
 	
 	# Dispatch
 	var compute_list = rd.compute_list_begin()
