@@ -1,36 +1,29 @@
 #[compute]
 #version 450
 
-layout(set = 0, binding = 0, std430) restrict readonly buffer CounterBuffer { uint visible_count; };
-layout(set = 0, binding = 1, std430) writeonly buffer CommandBuffer {
-	uint indexCount;    // Godot BoxMesh has 36 indices
-	uint instanceCount; // The exact number of visible items!
-	uint firstIndex;
-	uint vertexOffset;
-	uint firstInstance;
-};
+// Buffer B: The Array of Counters written by swarm.glsl
+layout(set = 0, binding = 0, std430) restrict readonly buffer CounterBuffer { uint visible_counts[]; };
 
-// -----------------------------------------------------------------------------
-// FAKE PUSH CONSTANTS
-// -----------------------------------------------------------------------------
-// layout(push_constant, std430) uniform Params {
-// 	float a;
-// 	float b;
-// 	uint c;
-// 	uint d;               // 4 bytes (Explicit padding to hit the 16-byte boundary)
-// 	vec4 e[6]; 
-// } params;
+// Buffer D: The Mega Command Buffer
+layout(set = 0, binding = 1, std430) writeonly buffer CommandBuffer { uint commands[]; };
 
-// Run this exactly ONCE per frame
-layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+// Run 64 threads per workgroup. We dispatch enough workgroups to hit at least 1000 threads.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 void main() {
-	// uint dummy = params.c; // Force the compiler to keep the struct!
-	// if (dummy == 999999) { indexCount = 0; } // Use it in a way that will never trigger
+	uint swarm_id = gl_GlobalInvocationID.x;
 	
-	indexCount = 36; 
-	instanceCount = visible_count;
-	firstIndex = 0;
-	vertexOffset = 0;
-	firstInstance = 0;
+	// Ensure we don't process out-of-bounds threads if the dispatch isn't a perfect multiple of 64
+	if (swarm_id >= 1000) { return; } 
+
+	// Each draw command requires exactly 5 uints.
+	uint cmd_offset = swarm_id * 5; 
+
+	// Godot BoxMesh has 36 indices. If you randomize meshes, you'll need to pass the index counts 
+	// in via a separate buffer or push constants later. For now, 36 is safe for the BoxMesh baseline.
+	commands[cmd_offset + 0] = 36;                     // indexCount
+	commands[cmd_offset + 1] = visible_counts[swarm_id]; // instanceCount
+	commands[cmd_offset + 2] = 0;                      // firstIndex
+	commands[cmd_offset + 3] = 0;                      // vertexOffset
+	commands[cmd_offset + 4] = 0;                      // firstInstance
 }

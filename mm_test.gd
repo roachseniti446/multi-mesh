@@ -1,6 +1,10 @@
 extends Node3D
 
-@export var swarm_count: int = 100000
+# --- Swarm Constants ---
+const SWARM_COUNT: int = 1000
+const INSTANCES_PER_SWARM: int = 1000
+const TOTAL_INSTANCES: int = SWARM_COUNT * INSTANCES_PER_SWARM
+
 @export var spawn_radius: float = 50.0
 
 var enable_colors: bool = true
@@ -9,9 +13,13 @@ var enable_compute: bool = true
 var cam: Camera3D
 
 # --- Low-Level Rendering Variables ---
-var base_mesh: BoxMesh         # MUST keep a reference so it isn't garbage collected.
-var mm_rid: RID                # The raw MultiMesh RID
-var rs_instance: RID           # The raw RenderingServer instance RID
+var base_meshes: Array[Mesh] = []
+var mm_rids: Array[RID] = []
+var rs_instances: Array[RID] = []
+
+# Keep references to the internal MultiMesh compute buffers for our copy pass later!
+var mm_transform_buffers: Array[RID] = []
+var mm_cmd_buffers: Array[RID] = []
 
 # --- Compute Variables ---
 var rd: RenderingDevice
@@ -25,7 +33,12 @@ var cmd_pipeline: RID
 var cmd_uniform_set: RID
 
 var entity_buffer: RID
-var counter_buffer: RID # BUFFER B: Atomic Counter
+var counter_buffer: RID # BUFFER B: Atomic Counter Array
+
+# --- Mega-Buffers (To replace the single outputs) ---
+var mega_transform_buffer: RID
+var mega_cmd_buffer: RID
+
 var push_constant_bytes := PackedByteArray()
 var time_elapsed: float = 0.0
 var compute_initialized: bool = false
@@ -54,47 +67,53 @@ func _setup_camera() -> void:
 	cam.make_current()
 
 func _setup_server_swarm() -> void:
-	# 1. Create and hold onto the base mesh
-	base_mesh = BoxMesh.new()
-	base_mesh.size = Vector3(1, 1, 1)
-	
-	if enable_colors:
-		var mat = StandardMaterial3D.new()
-		mat.vertex_color_use_as_albedo = true
-		base_mesh.material = mat
-	
-	# 2. Create the MultiMesh completely on the RenderingServer
-	mm_rid = RenderingServer.multimesh_create()
-	
-	# 3. Allocate the memory WITH the indirect flag (the 'true' at the end)
-	RenderingServer.multimesh_allocate_data(
-		mm_rid, 
-		swarm_count, 
-		RenderingServer.MULTIMESH_TRANSFORM_3D, 
-		enable_colors, 
-		false,         
-		true           # use_indirect = true!
-	)
-	
-	# 4. Assign the mesh
-	RenderingServer.multimesh_set_mesh(mm_rid, base_mesh.get_rid())
-	
-	# 5. Populate initial zero-state data
-	for i in swarm_count:
-		var t = Transform3D(Basis(), Vector3.ZERO)
-		RenderingServer.multimesh_instance_set_transform(mm_rid, i, t)
-		if enable_colors:
-			RenderingServer.multimesh_instance_set_color(mm_rid, i, Color(1, 1, 1, 1))
-
-	# 6. Create the instance and attach to world
-	rs_instance = RenderingServer.instance_create()
-	RenderingServer.instance_set_base(rs_instance, mm_rid)
 	var scenario = get_world_3d().scenario
-	RenderingServer.instance_set_scenario(rs_instance, scenario)
-	
-	# Prevent Frustum Culling
 	var massive_aabb = AABB(Vector3(-10000, -10000, -10000), Vector3(20000, 20000, 20000))
-	RenderingServer.instance_set_custom_aabb(rs_instance, massive_aabb)
+	
+	for swarm_id in SWARM_COUNT:
+		# 1. Create the base mesh
+		var mesh = BoxMesh.new()
+		mesh.size = Vector3(1, 1, 1)
+		
+		if enable_colors:
+			var mat = StandardMaterial3D.new()
+			mat.vertex_color_use_as_albedo = true
+			mesh.material = mat
+			
+		base_meshes.append(mesh)
+		
+		# 2. Create the MultiMesh completely on the RenderingServer
+		var mm_rid = RenderingServer.multimesh_create()
+		mm_rids.append(mm_rid)
+		
+		# 3. Allocate the memory WITH the indirect flag
+		RenderingServer.multimesh_allocate_data(
+			mm_rid, 
+			INSTANCES_PER_SWARM, 
+			RenderingServer.MULTIMESH_TRANSFORM_3D, 
+			enable_colors, 
+			false,         
+			true           # use_indirect = true!
+		)
+		
+		# 4. Assign the mesh
+		RenderingServer.multimesh_set_mesh(mm_rid, mesh.get_rid())
+		
+		# 5. Populate initial zero-state data
+		for i in INSTANCES_PER_SWARM:
+			var t = Transform3D(Basis(), Vector3.ZERO)
+			RenderingServer.multimesh_instance_set_transform(mm_rid, i, t)
+			if enable_colors:
+				RenderingServer.multimesh_instance_set_color(mm_rid, i, Color(1, 1, 1, 1))
+
+		# 6. Create the instance and attach to world
+		var rs_instance = RenderingServer.instance_create()
+		rs_instances.append(rs_instance)
+		RenderingServer.instance_set_base(rs_instance, mm_rid)
+		RenderingServer.instance_set_scenario(rs_instance, scenario)
+		
+		# Prevent Frustum Culling
+		RenderingServer.instance_set_custom_aabb(rs_instance, massive_aabb)
 
 func _init_compute() -> void:
 	rd = RenderingServer.get_rendering_device()
@@ -111,37 +130,45 @@ func _init_compute() -> void:
 	cmd_shader = rd.shader_create_from_spirv(cmd_file.get_spirv())
 	cmd_pipeline = rd.compute_pipeline_create(cmd_shader)
 
-	# 2. Setup Entity Buffer (Buffer A)
+	# 2. Setup Entity Buffer (Buffer A) - NOW SCALED TO TOTAL_INSTANCES
 	var entity_bytes := PackedByteArray()
-	entity_bytes.resize(swarm_count * 32) # 32 bytes per struct (vec4 pos, vec4 vel)
-	
-	for i in swarm_count:
+	entity_bytes.resize(TOTAL_INSTANCES * 32)
+	for i in TOTAL_INSTANCES:
 		var offset = i * 32
-		# Position XYZ
 		entity_bytes.encode_float(offset + 0, randf_range(-spawn_radius, spawn_radius))
 		entity_bytes.encode_float(offset + 4, randf_range(-spawn_radius, spawn_radius))
 		entity_bytes.encode_float(offset + 8, randf_range(-spawn_radius, spawn_radius))
-		# Phase offset (w)
-		entity_bytes.encode_float(offset + 12, randf() * PI * 2.0) 
-		
-		# Velocity XYZ
+		entity_bytes.encode_float(offset + 12, randf() * PI * 2.0)
 		entity_bytes.encode_float(offset + 16, randf_range(10.0, 30.0))
-		entity_bytes.encode_float(offset + 20, randf_range(5.0, 15.0)) # Upward speed
+		entity_bytes.encode_float(offset + 20, randf_range(5.0, 15.0))
 		entity_bytes.encode_float(offset + 24, randf_range(10.0, 30.0))
-		# Speed multiplier (w)
 		entity_bytes.encode_float(offset + 28, randf_range(0.5, 2.0))
-
 	entity_buffer = rd.storage_buffer_create(entity_bytes.size(), entity_bytes)
 
-	# 3. Setup Atomic Counter Buffer (Buffer B)
+	# 3. Setup Atomic Counter Buffer (Buffer B) - NOW AN ARRAY!
 	var counter_bytes := PackedByteArray()
-	counter_bytes.resize(4) # 1 uint initialized to 0
+	counter_bytes.resize(4 * SWARM_COUNT) # 1000 uints initialized to 0
 	counter_buffer = rd.storage_buffer_create(counter_bytes.size(), counter_bytes)
 
-	# 4. Grab MultiMesh Buffers (Buffers C & D)
-	# Using the raw mm_rid from our pure server setup!
-	var mm_output_buffer = RenderingServer.multimesh_get_buffer_rd_rid(mm_rid)
-	var mm_cmd_buffer = RenderingServer.multimesh_get_command_buffer_rd_rid(mm_rid)
+	# 4. Grab MultiMesh Buffers & Setup Mega Buffers
+	mm_transform_buffers.clear()
+	mm_cmd_buffers.clear()
+	
+	for mm_rid in mm_rids:
+		mm_transform_buffers.append(RenderingServer.multimesh_get_buffer_rd_rid(mm_rid))
+		mm_cmd_buffers.append(RenderingServer.multimesh_get_command_buffer_rd_rid(mm_rid))
+
+	# Buffer C: Mega Transform Buffer
+	# 1000 swarms * 1000 instances * 64 bytes (4 vec4s per transform)
+	var mega_transform_bytes := PackedByteArray()
+	mega_transform_bytes.resize(TOTAL_INSTANCES * 64)
+	mega_transform_buffer = rd.storage_buffer_create(mega_transform_bytes.size(), mega_transform_bytes)
+
+	# Buffer D: Mega Command Buffer
+	# 1000 swarms * 5 uints * 4 bytes
+	var mega_cmd_bytes := PackedByteArray()
+	mega_cmd_bytes.resize(SWARM_COUNT * 20)
+	mega_cmd_buffer = rd.storage_buffer_create(mega_cmd_bytes.size(), mega_cmd_bytes)
 
 	# 5. Create Uniforms - CULLING PASS
 	var u_entities = RDUniform.new()
@@ -152,7 +179,7 @@ func _init_compute() -> void:
 	var u_output = RDUniform.new()
 	u_output.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
 	u_output.binding = 1
-	u_output.add_id(mm_output_buffer)
+	u_output.add_id(mega_transform_buffer) # USE MEGA BUFFER
 	
 	var u_counter_cull = RDUniform.new()
 	u_counter_cull.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
@@ -170,7 +197,7 @@ func _init_compute() -> void:
 	var u_cmd_output = RDUniform.new()
 	u_cmd_output.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
 	u_cmd_output.binding = 1
-	u_cmd_output.add_id(mm_cmd_buffer)
+	u_cmd_output.add_id(mega_cmd_buffer) # USE MEGA BUFFER
 	
 	cmd_uniform_set = rd.uniform_set_create([u_counter_cmd, u_cmd_output], cmd_shader, 0)
 	
@@ -182,54 +209,81 @@ func _process(delta: float) -> void:
 	
 	time_elapsed += delta
 	
-	# Pack Push Constants
+	# 1. Pack Push Constants
 	push_constant_bytes.encode_float(0, time_elapsed)
 	push_constant_bytes.encode_float(4, delta)
-	push_constant_bytes.encode_u32(8, swarm_count)
+	push_constant_bytes.encode_u32(8, TOTAL_INSTANCES) # Use TOTAL_INSTANCES here
 	# bytes 12-15 are the padding
 	
-	# 2. Extract and Pack Camera Frustum Planes
-	# get_frustum() returns an Array[Plane] of size 6
+	# Extract and Pack Camera Frustum Planes
 	var planes = cam.get_frustum()
-	var offset = 16 
-	
+	var offset = 16
 	for i in 6:
 		var p: Plane = planes[i]
-		# Plane normal (xyz) and distance (w)
 		push_constant_bytes.encode_float(offset + 0, p.normal.x)
 		push_constant_bytes.encode_float(offset + 4, p.normal.y)
 		push_constant_bytes.encode_float(offset + 8, p.normal.z)
 		push_constant_bytes.encode_float(offset + 12, p.d)
 		offset += 16
 		
-	# 2. Reset the atomic counter BEFORE starting the compute list
-	rd.buffer_clear(counter_buffer, 0, 4)
-	
-	#var _compute_list = rd.compute_list_begin()
+	# 2. Reset the atomic counter array BEFORE starting the compute list
+	rd.buffer_clear(counter_buffer, 0, 4 * SWARM_COUNT)
 	
 	# --- PASS 1: Physics & Culling ---
 	var cull_list = rd.compute_list_begin()
 	rd.compute_list_bind_compute_pipeline(cull_list, cull_pipeline)
 	rd.compute_list_bind_uniform_set(cull_list, cull_uniform_set, 0)
 	rd.compute_list_set_push_constant(cull_list, push_constant_bytes, push_constant_bytes.size())
-	var workgroups_x = ceil(swarm_count / 64.0)
+	
+	var workgroups_x = ceil(TOTAL_INSTANCES / 64.0)
 	rd.compute_list_dispatch(cull_list, workgroups_x, 1, 1)
-	rd.compute_list_add_barrier(cull_list) # Wait for buffer B and C
+	
+	rd.compute_list_add_barrier(cull_list)
 	rd.compute_list_end()
 	
 	# --- PASS 2: Write Command Buffer ---
-	# A brand new list. No push constant state carried over.
 	var cmd_list = rd.compute_list_begin()
 	rd.compute_list_bind_compute_pipeline(cmd_list, cmd_pipeline)
 	rd.compute_list_bind_uniform_set(cmd_list, cmd_uniform_set, 0)
-	rd.compute_list_dispatch(cmd_list, 1, 1, 1)
-	rd.compute_list_add_barrier(cmd_list) # Wait for buffer D
+	
+	# Dispatch enough 64-thread workgroups to cover 1000 swarms
+	var cmd_workgroups = ceil(SWARM_COUNT / 64.0) 
+	rd.compute_list_dispatch(cmd_list, cmd_workgroups, 1, 1)
+	
+	rd.compute_list_add_barrier(cmd_list)
 	rd.compute_list_end()
 
-# --- CRITICAL: MANUAL MEMORY MANAGEMENT ---
+	# --- PASS 3: The Data Distributor (VRAM to VRAM) ---
+	# Copy the partitioned data from our Mega-Buffers into Godot's native MultiMeshes.
+	
+	var transform_stride = 64 # 4 vec4s per transform (16 floats * 4 bytes)
+	var swarm_byte_size = INSTANCES_PER_SWARM * transform_stride
+	var cmd_byte_size = 20 # 5 uints * 4 bytes
+
+	for i in SWARM_COUNT:
+		# 1. Distribute Transforms (Buffer C slice -> MultiMesh i internal buffer)
+		rd.buffer_copy(
+			mega_transform_buffer,      # Source (Our Mega Buffer)
+			mm_transform_buffers[i],    # Destination (This specific MultiMesh)
+			i * swarm_byte_size,        # Source Offset (Skip to this swarm's chunk)
+			0,                          # Destination Offset
+			swarm_byte_size             # Size to copy
+		)
+		
+		# 2. Distribute Draw Commands (Buffer D slice -> MultiMesh i command buffer)
+		rd.buffer_copy(
+			mega_cmd_buffer,
+			mm_cmd_buffers[i],
+			i * cmd_byte_size,
+			0,
+			cmd_byte_size
+		)
+
 func _exit_tree() -> void:
-	# When bypassing the scene tree, we are responsible for cleaning up the RIDs
-	if rs_instance.is_valid():
-		RenderingServer.free_rid(rs_instance)
-	if mm_rid.is_valid():
-		RenderingServer.free_rid(mm_rid)
+	# Clean up our manual RIDs!
+	for rs_instance in rs_instances:
+		if rs_instance.is_valid():
+			RenderingServer.free_rid(rs_instance)
+	for mm_rid in mm_rids:
+		if mm_rid.is_valid():
+			RenderingServer.free_rid(mm_rid)
